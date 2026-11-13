@@ -132,6 +132,14 @@ pub struct TorClient {
     buffer: String,
 }
 
+/// Escapes backslashes and double quotes for Tor control-port quoted strings.
+///
+/// Backslashes must be replaced first so that the newly added escape slashes
+/// for double quotes are not inadvertently double-escaped.
+fn escape_tor_quoted_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 impl TorClient {
     /// Connects and authenticates (`createTorClient` + `connect`,
     /// `src/tor/client.ts:33-56`).
@@ -144,8 +152,9 @@ impl TorClient {
             buffer: String::new(),
         };
 
+        let escaped_password = escape_tor_quoted_string(password);
         let reply = client
-            .send_command(&format!("AUTHENTICATE \"{password}\""))
+            .send_command(&format!("AUTHENTICATE \"{escaped_password}\""))
             .await?;
 
         if !reply.starts_with("250") {
@@ -537,5 +546,57 @@ mod tests {
 
         assert!(write_private_key(&path, "ED25519-V3:secret").await.is_err());
         assert!(!path.exists());
+
+        #[test]
+    fn test_escape_tor_quoted_string() {
+        use super::escape_tor_quoted_string;
+
+        assert_eq!(escape_tor_quoted_string(""), "");
+        assert_eq!(escape_tor_quoted_string("simple_password"), "simple_password");
+        assert_eq!(escape_tor_quoted_string(r#"pass"word"#), r#"pass\"word"#);
+        assert_eq!(escape_tor_quoted_string(r#"pass\word"#), r#"pass\\word"#);
+        assert_eq!(
+            escape_tor_quoted_string(r#"pass\"with\\both"#),
+            r#"pass\\\"with\\\\both"#
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_sends_escaped_quotes_and_backslashes() {
+        use super::TorClient;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock control port");
+        let port = listener.local_addr().expect("local address").port();
+
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buf = [0u8; 1024];
+            let n = socket.read(&mut buf).await.expect("read command");
+            let received = String::from_utf8_lossy(&buf[..n]);
+
+            // Verify exact wire command with escaped quotes and backslashes
+            assert_eq!(
+                received,
+                "AUTHENTICATE \"pass\\\"word\\\\test\"\r\n",
+                "Tor control command must escape quotes and backslashes"
+            );
+
+            socket
+                .write_all(b"250 OK\r\n")
+                .await
+                .expect("send 250 reply");
+        });
+
+        let client = TorClient::connect("127.0.0.1", port, r#"pass"word\test"#)
+            .await
+            .expect("TorClient connection succeeds");
+
+        server_task.await.expect("mock server finishes");
+        drop(client);
+    }
     }
 }
